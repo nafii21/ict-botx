@@ -251,20 +251,97 @@ def send_telegram(message):
         log.error(f"Error Telegram: {e}")
 
 
+SIGNAL_GUIDE = {
+    ("Order Block", "BULLISH 🟢"): {
+        "aksi": "Pertimbangkan BUY",
+        "sl": "Pasang SL di bawah zona Order Block",
+        "tp": "Target TP di resistance / High terdekat",
+        "tips": "Tunggu candle bullish konfirmasi (engulfing/pin bar) sebelum entry"
+    },
+    ("Order Block", "BEARISH 🔴"): {
+        "aksi": "Pertimbangkan SELL",
+        "sl": "Pasang SL di atas zona Order Block",
+        "tp": "Target TP di support / Low terdekat",
+        "tips": "Tunggu candle bearish konfirmasi (engulfing/pin bar) sebelum entry"
+    },
+    ("Fair Value Gap", "BULLISH 🟢"): {
+        "aksi": "Pertimbangkan BUY",
+        "sl": "Pasang SL di bawah FVG (beberapa pips di bawah gap)",
+        "tp": "Target TP di High sebelum gap terbentuk",
+        "tips": "Entry saat harga masuk gap dan mulai rejection ke atas"
+    },
+    ("Fair Value Gap", "BEARISH 🔴"): {
+        "aksi": "Pertimbangkan SELL",
+        "sl": "Pasang SL di atas FVG (beberapa pips di atas gap)",
+        "tp": "Target TP di Low sebelum gap terbentuk",
+        "tips": "Entry saat harga masuk gap dan mulai rejection ke bawah"
+    },
+    ("BOS", "BULLISH 🟢"): {
+        "aksi": "Pertimbangkan BUY",
+        "sl": "Pasang SL di bawah Low terakhir sebelum BOS",
+        "tp": "Target TP di resistance / High berikutnya",
+        "tips": "Tunggu retest struktur yang baru ditembus sebelum entry"
+    },
+    ("BOS", "BEARISH 🔴"): {
+        "aksi": "Pertimbangkan SELL",
+        "sl": "Pasang SL di atas High terakhir sebelum BOS",
+        "tp": "Target TP di support / Low berikutnya",
+        "tips": "Tunggu retest struktur yang baru ditembus sebelum entry"
+    },
+    ("CHoCH", "BULLISH 🟢"): {
+        "aksi": "Pertimbangkan BUY — tren bisa berbalik naik",
+        "sl": "Pasang SL di bawah Low yang baru terbentuk",
+        "tp": "Target TP di High sebelumnya",
+        "tips": "CHoCH = sinyal awal pembalikan, konfirmasi dulu di chart sebelum entry"
+    },
+    ("CHoCH", "BEARISH 🔴"): {
+        "aksi": "Pertimbangkan SELL — tren bisa berbalik turun",
+        "sl": "Pasang SL di atas High yang baru terbentuk",
+        "tp": "Target TP di Low sebelumnya",
+        "tips": "CHoCH = sinyal awal pembalikan, konfirmasi dulu di chart sebelum entry"
+    },
+    ("Liquidity Sweep", "BULLISH 🟢"): {
+        "aksi": "Pertimbangkan BUY — harga sudah ambil likuiditas bawah",
+        "sl": "Pasang SL di bawah spike / Low yang baru terbentuk",
+        "tp": "Target TP di High sebelum sweep terjadi",
+        "tips": "Pastikan harga sudah reversal dan tutup di atas Low lama sebelum entry"
+    },
+    ("Liquidity Sweep", "BEARISH 🔴"): {
+        "aksi": "Pertimbangkan SELL — harga sudah ambil likuiditas atas",
+        "sl": "Pasang SL di atas spike / High yang baru terbentuk",
+        "tp": "Target TP di Low sebelum sweep terjadi",
+        "tips": "Pastikan harga sudah reversal dan tutup di bawah High lama sebelum entry"
+    },
+}
+
 def format_signal_message(signals, df):
     current_price = df["close"].iloc[-1]
+    high_5 = df["high"].tail(20).max()
+    low_5 = df["low"].tail(20).min()
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
     lines = [
         f"📊 *ICT SIGNAL — {SYMBOL}*",
         f"🕐 {now} | TF: {TIMEFRAME}",
         f"💰 Harga saat ini: *{current_price:.2f}*",
-        "─────────────────────"
+        f"📈 High 20 candle: {high_5:.2f} | 📉 Low 20 candle: {low_5:.2f}",
+        "━━━━━━━━━━━━━━━━━━━━━"
     ]
+
     for s in signals:
-        lines.append(f"🔔 *{s['type']}* — {s['direction']}")
+        guide = SIGNAL_GUIDE.get((s["type"], s["direction"]), None)
+        lines.append(f"\n🔔 *{s['type']}* — {s['direction']}")
         lines.append(f"   ↳ {s['detail']}")
-    lines.append("─────────────────────")
-    lines.append("⚠️ _Ini hanya sinyal, keputusan ada di tangan Anda._")
+        if guide:
+            lines.append(f"\n   📌 *Rekomendasi:*")
+            lines.append(f"   • Aksi   : {guide['aksi']}")
+            lines.append(f"   • SL     : {guide['sl']}")
+            lines.append(f"   • TP     : {guide['tp']}")
+            lines.append(f"   • 💡 Tips: _{guide['tips']}_")
+        lines.append("─────────────────────")
+
+    lines.append("\n⚠️ _Konfirmasi di chart sebelum entry. Selalu pakai SL!_")
+    lines.append("_Bot ini hanya sinyal, bukan saran finansial._")
     return "\n".join(lines)
 
 
