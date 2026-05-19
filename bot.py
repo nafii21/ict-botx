@@ -1,391 +1,304 @@
+"""
+ICT MSS/BOS Bot - XAUUSD H1
+Replika logic LuxAlgo ICT Concepts (MSS + BOS)
+Notifikasi otomatis via Telegram
+"""
+
 import os
 import time
 import logging
 import requests
 import pandas as pd
-import numpy as np
-from datetime import datetime
+import yfinance as yf
+from datetime import datetime, timezone
 
-# ─────────────────────────────────────────────
-# KONFIGURASI — isi sebelum menjalankan bot
-# ─────────────────────────────────────────────
-TELEGRAM_TOKEN = "8919806833:AAHJZdzA0qwsky2862y062MJskK7kLmIG24"   # dari @BotFather
-TELEGRAM_CHAT_ID = "6273206309"             # dari @userinfobot
-TWELVEDATA_API_KEY = "64d9b87e7c5a4d4f8e625ec95da13b0f"     # gratis di twelvedata.com
+# ─────────────────────────────────────────
+#  KONFIGURASI — isi sesuai kebutuhan
+# ─────────────────────────────────────────
+TELEGRAM_TOKEN   = os.getenv("8919806833:AAHJZdzA0qwsky2862y062MJskK7kLmIG24")
+TELEGRAM_CHAT_ID = os.getenv("6273206309")
 
-SYMBOL = "XAU/USD"
-TIMEFRAME = "5min"       # gunakan "1min" atau "5min"
-CHECK_INTERVAL = 60      # cek setiap 60 detik
-LOOKBACK = 100           # jumlah candle yang diambil
+SYMBOL      = "GC=F"        # XAUUSD di yfinance (Gold Futures)
+TIMEFRAME   = "1h"          # H1
+SWING_LEN   = 5             # pivot length (sama dgn Pine Script default)
+CHECK_EVERY = 300           # cek tiap 5 menit (detik)
 
-# ─────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+# ─────────────────────────────────────────
+#  LOGGING
+# ─────────────────────────────────────────
+logging.basicConfig(
+    level   = logging.INFO,
+    format  = "%(asctime)s [%(levelname)s] %(message)s",
+    handlers= [logging.StreamHandler()]
+)
 log = logging.getLogger(__name__)
 
-
-# ══════════════════════════════════════════════
-# 1. AMBIL DATA CANDLE
-# ══════════════════════════════════════════════
-def get_candles(symbol=SYMBOL, interval=TIMEFRAME, outputsize=LOOKBACK):
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": TWELVEDATA_API_KEY,
-        "format": "JSON"
-    }
-    try:
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-        if "values" not in data:
-            log.error(f"API error: {data}")
-            return None
-        df = pd.DataFrame(data["values"])
-        df = df.rename(columns={"datetime": "time", "open": "open", "high": "high",
-                                 "low": "low", "close": "close", "volume": "volume"})
-        df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
-        df = df.iloc[::-1].reset_index(drop=True)  # urutkan dari lama ke baru
-        return df
-    except Exception as e:
-        log.error(f"Gagal ambil data: {e}")
-        return None
-
-
-# ══════════════════════════════════════════════
-# 2. DETEKSI BREAK OF STRUCTURE (BOS) & CHoCH
-# ══════════════════════════════════════════════
-def detect_bos_choch(df):
-    signals = []
-    highs = df["high"].values
-    lows = df["low"].values
-    closes = df["close"].values
-    n = len(df)
-
-    # Cari swing high & swing low sederhana (3-candle pivot)
-    for i in range(2, n - 1):
-        # Swing High
-        if highs[i - 1] > highs[i - 2] and highs[i - 1] > highs[i]:
-            prev_swing_high = highs[i - 1]
-            # BOS Bullish: harga close menembus swing high sebelumnya
-            if closes[-1] > prev_swing_high:
-                signals.append({
-                    "type": "BOS",
-                    "direction": "BULLISH 🟢",
-                    "detail": f"Harga menembus Swing High {prev_swing_high:.2f}"
-                })
-                break
-
-        # Swing Low
-        if lows[i - 1] < lows[i - 2] and lows[i - 1] < lows[i]:
-            prev_swing_low = lows[i - 1]
-            # BOS Bearish: harga close menembus swing low sebelumnya
-            if closes[-1] < prev_swing_low:
-                signals.append({
-                    "type": "BOS",
-                    "direction": "BEARISH 🔴",
-                    "detail": f"Harga menembus Swing Low {prev_swing_low:.2f}"
-                })
-                break
-
-    # CHoCH: deteksi perubahan struktur (berlawanan dari tren sebelumnya)
-    recent = df.tail(20)
-    trend_up = recent["close"].iloc[-1] > recent["close"].iloc[0]
-    last_high = recent["high"].max()
-    last_low = recent["low"].min()
-
-    if trend_up and closes[-1] < last_low:
-        signals.append({
-            "type": "CHoCH",
-            "direction": "BEARISH 🔴",
-            "detail": f"Perubahan struktur — harga tembus Low {last_low:.2f}"
-        })
-    elif not trend_up and closes[-1] > last_high:
-        signals.append({
-            "type": "CHoCH",
-            "direction": "BULLISH 🟢",
-            "detail": f"Perubahan struktur — harga tembus High {last_high:.2f}"
-        })
-
-    return signals
-
-
-# ══════════════════════════════════════════════
-# 3. DETEKSI ORDER BLOCK (OB)
-# ══════════════════════════════════════════════
-def detect_order_block(df):
-    signals = []
-    n = len(df)
-    closes = df["close"].values
-    opens = df["open"].values
-    highs = df["high"].values
-    lows = df["low"].values
-
-    # Cari candle bearish besar yang diikuti candle bullish (Bullish OB)
-    for i in range(n - 5, n - 1):
-        if i < 1:
-            continue
-        body = abs(closes[i] - opens[i])
-        avg_body = np.mean([abs(closes[j] - opens[j]) for j in range(max(0, i - 10), i)])
-
-        # Bullish OB: candle bearish besar sebelum gerakan naik
-        if opens[i] > closes[i] and body > avg_body * 1.2:
-            ob_high = highs[i]
-            ob_low = lows[i]
-            current_price = closes[-1]
-            # Harga kembali ke zona OB
-            if ob_low <= current_price <= ob_high:
-                signals.append({
-                    "type": "Order Block",
-                    "direction": "BULLISH 🟢",
-                    "detail": f"Harga masuk zona Bullish OB [{ob_low:.2f} - {ob_high:.2f}]"
-                })
-
-        # Bearish OB: candle bullish besar sebelum gerakan turun
-        if closes[i] > opens[i] and body > avg_body * 1.2:
-            ob_high = highs[i]
-            ob_low = lows[i]
-            current_price = closes[-1]
-            if ob_low <= current_price <= ob_high:
-                signals.append({
-                    "type": "Order Block",
-                    "direction": "BEARISH 🔴",
-                    "detail": f"Harga masuk zona Bearish OB [{ob_low:.2f} - {ob_high:.2f}]"
-                })
-
-    return signals
-
-
-# ══════════════════════════════════════════════
-# 4. DETEKSI FAIR VALUE GAP (FVG)
-# ══════════════════════════════════════════════
-def detect_fvg(df):
-    signals = []
-    n = len(df)
-    highs = df["high"].values
-    lows = df["low"].values
-    closes = df["close"].values
-
-    for i in range(1, n - 1):
-        # Bullish FVG: low[i+1] > high[i-1]
-        if lows[i + 1] > highs[i - 1]:
-            fvg_low = highs[i - 1]
-            fvg_high = lows[i + 1]
-            current_price = closes[-1]
-            if fvg_low <= current_price <= fvg_high:
-                signals.append({
-                    "type": "Fair Value Gap",
-                    "direction": "BULLISH 🟢",
-                    "detail": f"Harga mengisi Bullish FVG [{fvg_low:.2f} - {fvg_high:.2f}]"
-                })
-
-        # Bearish FVG: high[i+1] < low[i-1]
-        if highs[i + 1] < lows[i - 1]:
-            fvg_high = lows[i - 1]
-            fvg_low = highs[i + 1]
-            current_price = closes[-1]
-            if fvg_low <= current_price <= fvg_high:
-                signals.append({
-                    "type": "Fair Value Gap",
-                    "direction": "BEARISH 🔴",
-                    "detail": f"Harga mengisi Bearish FVG [{fvg_low:.2f} - {fvg_high:.2f}]"
-                })
-
-    return signals
-
-
-# ══════════════════════════════════════════════
-# 5. DETEKSI LIQUIDITY SWEEP
-# ══════════════════════════════════════════════
-def detect_liquidity_sweep(df):
-    signals = []
-    recent = df.tail(30)
-    highs = recent["high"].values
-    lows = recent["low"].values
-    closes = recent["close"].values
-    n = len(highs)
-
-    # Ambil equal highs / equal lows (likuiditas)
-    prev_high = max(highs[:-3])
-    prev_low = min(lows[:-3])
-    current_high = highs[-1]
-    current_low = lows[-1]
-    current_close = closes[-1]
-
-    # Bullish sweep: harga spike ke bawah prev_low lalu kembali naik
-    if current_low < prev_low and current_close > prev_low:
-        signals.append({
-            "type": "Liquidity Sweep",
-            "direction": "BULLISH 🟢",
-            "detail": f"Sweep BSL — spike ke bawah {prev_low:.2f} lalu reversal naik"
-        })
-
-    # Bearish sweep: harga spike ke atas prev_high lalu kembali turun
-    if current_high > prev_high and current_close < prev_high:
-        signals.append({
-            "type": "Liquidity Sweep",
-            "direction": "BEARISH 🔴",
-            "detail": f"Sweep SSL — spike ke atas {prev_high:.2f} lalu reversal turun"
-        })
-
-    return signals
-
-
-# ══════════════════════════════════════════════
-# 6. KIRIM NOTIFIKASI TELEGRAM
-# ══════════════════════════════════════════════
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        if r.status_code == 200:
-            log.info("✅ Notifikasi terkirim")
-        else:
-            log.error(f"Gagal kirim: {r.text}")
-    except Exception as e:
-        log.error(f"Error Telegram: {e}")
-
-
-SIGNAL_GUIDE = {
-    ("Order Block", "BULLISH 🟢"): {
-        "aksi": "Pertimbangkan BUY",
-        "sl": "Pasang SL di bawah zona Order Block",
-        "tp": "Target TP di resistance / High terdekat",
-        "tips": "Tunggu candle bullish konfirmasi (engulfing/pin bar) sebelum entry"
-    },
-    ("Order Block", "BEARISH 🔴"): {
-        "aksi": "Pertimbangkan SELL",
-        "sl": "Pasang SL di atas zona Order Block",
-        "tp": "Target TP di support / Low terdekat",
-        "tips": "Tunggu candle bearish konfirmasi (engulfing/pin bar) sebelum entry"
-    },
-    ("Fair Value Gap", "BULLISH 🟢"): {
-        "aksi": "Pertimbangkan BUY",
-        "sl": "Pasang SL di bawah FVG (beberapa pips di bawah gap)",
-        "tp": "Target TP di High sebelum gap terbentuk",
-        "tips": "Entry saat harga masuk gap dan mulai rejection ke atas"
-    },
-    ("Fair Value Gap", "BEARISH 🔴"): {
-        "aksi": "Pertimbangkan SELL",
-        "sl": "Pasang SL di atas FVG (beberapa pips di atas gap)",
-        "tp": "Target TP di Low sebelum gap terbentuk",
-        "tips": "Entry saat harga masuk gap dan mulai rejection ke bawah"
-    },
-    ("BOS", "BULLISH 🟢"): {
-        "aksi": "Pertimbangkan BUY",
-        "sl": "Pasang SL di bawah Low terakhir sebelum BOS",
-        "tp": "Target TP di resistance / High berikutnya",
-        "tips": "Tunggu retest struktur yang baru ditembus sebelum entry"
-    },
-    ("BOS", "BEARISH 🔴"): {
-        "aksi": "Pertimbangkan SELL",
-        "sl": "Pasang SL di atas High terakhir sebelum BOS",
-        "tp": "Target TP di support / Low berikutnya",
-        "tips": "Tunggu retest struktur yang baru ditembus sebelum entry"
-    },
-    ("CHoCH", "BULLISH 🟢"): {
-        "aksi": "Pertimbangkan BUY — tren bisa berbalik naik",
-        "sl": "Pasang SL di bawah Low yang baru terbentuk",
-        "tp": "Target TP di High sebelumnya",
-        "tips": "CHoCH = sinyal awal pembalikan, konfirmasi dulu di chart sebelum entry"
-    },
-    ("CHoCH", "BEARISH 🔴"): {
-        "aksi": "Pertimbangkan SELL — tren bisa berbalik turun",
-        "sl": "Pasang SL di atas High yang baru terbentuk",
-        "tp": "Target TP di Low sebelumnya",
-        "tips": "CHoCH = sinyal awal pembalikan, konfirmasi dulu di chart sebelum entry"
-    },
-    ("Liquidity Sweep", "BULLISH 🟢"): {
-        "aksi": "Pertimbangkan BUY — harga sudah ambil likuiditas bawah",
-        "sl": "Pasang SL di bawah spike / Low yang baru terbentuk",
-        "tp": "Target TP di High sebelum sweep terjadi",
-        "tips": "Pastikan harga sudah reversal dan tutup di atas Low lama sebelum entry"
-    },
-    ("Liquidity Sweep", "BEARISH 🔴"): {
-        "aksi": "Pertimbangkan SELL — harga sudah ambil likuiditas atas",
-        "sl": "Pasang SL di atas spike / High yang baru terbentuk",
-        "tp": "Target TP di Low sebelum sweep terjadi",
-        "tips": "Pastikan harga sudah reversal dan tutup di bawah High lama sebelum entry"
-    },
+# ─────────────────────────────────────────
+#  STATE — simpan kondisi market terakhir
+# ─────────────────────────────────────────
+state = {
+    "mss_dir"       : 0,      # 1=bullish, -1=bearish, 0=neutral
+    "last_signal"   : None,   # hindari notif duplikat
+    "last_swing_high": None,
+    "last_swing_low" : None,
 }
 
-def format_signal_message(signals, df):
-    current_price = df["close"].iloc[-1]
-    high_5 = df["high"].tail(20).max()
-    low_5 = df["low"].tail(20).min()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+# ─────────────────────────────────────────
+#  FUNGSI TELEGRAM
+# ─────────────────────────────────────────
+def send_telegram(message: str):
+    url  = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    data = {
+        "chat_id"   : TELEGRAM_CHAT_ID,
+        "text"      : message,
+        "parse_mode": "HTML",
+    }
+    try:
+        r = requests.post(url, data=data, timeout=10)
+        if r.status_code == 200:
+            log.info("✅ Notifikasi terkirim ke Telegram")
+        else:
+            log.warning(f"❌ Gagal kirim Telegram: {r.text}")
+    except Exception as e:
+        log.error(f"❌ Error kirim Telegram: {e}")
 
-    lines = [
-        f"📊 *ICT SIGNAL — {SYMBOL}*",
-        f"🕐 {now} | TF: {TIMEFRAME}",
-        f"💰 Harga saat ini: *{current_price:.2f}*",
-        f"📈 High 20 candle: {high_5:.2f} | 📉 Low 20 candle: {low_5:.2f}",
-        "━━━━━━━━━━━━━━━━━━━━━"
-    ]
+# ─────────────────────────────────────────
+#  AMBIL DATA OHLC
+# ─────────────────────────────────────────
+def get_ohlc(symbol: str, interval: str, bars: int = 100) -> pd.DataFrame:
+    try:
+        df = yf.download(symbol, period="7d", interval=interval,
+                         progress=False, auto_adjust=True)
+        if df.empty:
+            log.warning("Data kosong dari yfinance")
+            return pd.DataFrame()
+        df = df.tail(bars).copy()
+        df.columns = [c.lower() for c in df.columns]
+        df.dropna(inplace=True)
+        return df
+    except Exception as e:
+        log.error(f"Error ambil data: {e}")
+        return pd.DataFrame()
 
-    for s in signals:
-        guide = SIGNAL_GUIDE.get((s["type"], s["direction"]), None)
-        lines.append(f"\n🔔 *{s['type']}* — {s['direction']}")
-        lines.append(f"   ↳ {s['detail']}")
-        if guide:
-            lines.append(f"\n   📌 *Rekomendasi:*")
-            lines.append(f"   • Aksi   : {guide['aksi']}")
-            lines.append(f"   • SL     : {guide['sl']}")
-            lines.append(f"   • TP     : {guide['tp']}")
-            lines.append(f"   • 💡 Tips: _{guide['tips']}_")
-        lines.append("─────────────────────")
+# ─────────────────────────────────────────
+#  DETEKSI SWING HIGH / LOW (Pivot)
+#  Sama dengan ta.pivothigh/pivotlow Pine Script
+# ─────────────────────────────────────────
+def get_pivots(df: pd.DataFrame, length: int):
+    """
+    Return list of (index, price, direction)
+    direction: 1 = swing high, -1 = swing low
+    """
+    pivots = []
+    highs = df["high"].values
+    lows  = df["low"].values
+    n     = len(df)
 
-    lines.append("\n⚠️ _Konfirmasi di chart sebelum entry. Selalu pakai SL!_")
-    lines.append("_Bot ini hanya sinyal, bukan saran finansial._")
-    return "\n".join(lines)
+    for i in range(length, n - length):
+        # Pivot High: candle[i] adalah tertinggi dalam window
+        if all(highs[i] >= highs[i - j] for j in range(1, length + 1)) and \
+           all(highs[i] >= highs[i + j] for j in range(1, length + 1)):
+            pivots.append((i, highs[i], 1))
 
+        # Pivot Low: candle[i] adalah terendah dalam window
+        if all(lows[i] <= lows[i - j] for j in range(1, length + 1)) and \
+           all(lows[i] <= lows[i + j] for j in range(1, length + 1)):
+            pivots.append((i, lows[i], -1))
 
-# ══════════════════════════════════════════════
-# 7. MAIN LOOP
-# ══════════════════════════════════════════════
-sent_signals = set()  # hindari notifikasi duplikat
+    # Urutkan berdasarkan index
+    pivots.sort(key=lambda x: x[0])
+    return pivots
 
-def run_bot():
-    log.info(f"🤖 Bot ICT {SYMBOL} mulai berjalan...")
-    send_telegram(f"🤖 *Bot ICT {SYMBOL} aktif!*\nMemantau sinyal di timeframe {TIMEFRAME}...")
+# ─────────────────────────────────────────
+#  BUILD ZIGZAG dari pivot list
+#  Replika logic aZZ di Pine Script
+# ─────────────────────────────────────────
+def build_zigzag(pivots: list) -> list:
+    """
+    Bersihkan pivot agar alternating: H-L-H-L atau L-H-L-H
+    Return list of (idx, price, direction)
+    """
+    if not pivots:
+        return []
+
+    zz = []
+    for p in pivots:
+        if not zz:
+            zz.append(p)
+            continue
+        last = zz[-1]
+        if p[2] == last[2]:
+            # Arah sama → ambil yang lebih ekstrem
+            if p[2] == 1 and p[1] > last[1]:
+                zz[-1] = p
+            elif p[2] == -1 and p[1] < last[1]:
+                zz[-1] = p
+        else:
+            zz.append(p)
+    return zz
+
+# ─────────────────────────────────────────
+#  DETEKSI MSS & BOS
+#  Replika logic switch MSS di Pine Script
+# ─────────────────────────────────────────
+def detect_mss_bos(df: pd.DataFrame, zz: list, mss_dir: int):
+    """
+    Cek candle terakhir apakah ada MSS atau BOS.
+    Return: (signal_type, price_level) atau (None, None)
+
+    signal_type: 'MSS_BULL', 'MSS_BEAR', 'BOS_BULL', 'BOS_BEAR'
+    """
+    if len(zz) < 3:
+        return None, None, mss_dir
+
+    close = df["close"].iloc[-1]
+
+    # Ambil 3 titik zigzag terakhir
+    # iH = index swing high di zigzag (Pine: aZZ.d.get(2)==1 ? 2 : 1)
+    # iL = index swing low  di zigzag
+    last3 = zz[-3:]
+
+    # Cari swing high & low terbaru dari 3 titik terakhir
+    swing_highs = [(i, p, d) for i, p, d in last3 if d == 1]
+    swing_lows  = [(i, p, d) for i, p, d in last3 if d == -1]
+
+    if not swing_highs or not swing_lows:
+        return None, None, mss_dir
+
+    recent_high = swing_highs[-1][1]
+    recent_low  = swing_lows[-1][1]
+
+    signal     = None
+    price_level= None
+
+    # ── MSS Bullish ──
+    # close > swing high AND sebelumnya bearish/neutral
+    if close > recent_high and mss_dir < 1:
+        signal      = "MSS_BULL"
+        price_level = recent_high
+        mss_dir     = 1
+
+    # ── MSS Bearish ──
+    # close < swing low AND sebelumnya bullish/neutral
+    elif close < recent_low and mss_dir > -1:
+        signal      = "MSS_BEAR"
+        price_level = recent_low
+        mss_dir     = -1
+
+    # ── BOS Bullish ──
+    # Sudah MSS bullish, close break swing high baru lagi
+    elif mss_dir == 1 and close > recent_high:
+        signal      = "BOS_BULL"
+        price_level = recent_high
+
+    # ── BOS Bearish ──
+    # Sudah MSS bearish, close break swing low baru lagi
+    elif mss_dir == -1 and close < recent_low:
+        signal      = "BOS_BEAR"
+        price_level = recent_low
+
+    return signal, price_level, mss_dir
+
+# ─────────────────────────────────────────
+#  FORMAT PESAN TELEGRAM
+# ─────────────────────────────────────────
+def format_message(signal: str, price: float, close: float, df: pd.DataFrame) -> str:
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    emoji_map = {
+        "MSS_BULL": "🟢",
+        "MSS_BEAR": "🔴",
+        "BOS_BULL": "🔵",
+        "BOS_BEAR": "🟠",
+    }
+    label_map = {
+        "MSS_BULL": "MSS Bullish — Market Structure Shift NAIK",
+        "MSS_BEAR": "MSS Bearish — Market Structure Shift TURUN",
+        "BOS_BULL": "BOS Bullish — Break of Structure NAIK",
+        "BOS_BEAR": "BOS Bearish — Break of Structure TURUN",
+    }
+    bias_map = {
+        "MSS_BULL": "📈 BULLISH",
+        "MSS_BEAR": "📉 BEARISH",
+        "BOS_BULL": "📈 BULLISH (lanjutan)",
+        "BOS_BEAR": "📉 BEARISH (lanjutan)",
+    }
+
+    high_1h = df["high"].iloc[-1]
+    low_1h  = df["low"].iloc[-1]
+
+    msg = (
+        f"{emoji_map[signal]} <b>ICT SIGNAL — XAUUSD H1</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📌 <b>{label_map[signal]}</b>\n\n"
+        f"💰 Close      : <b>${close:,.2f}</b>\n"
+        f"🎯 Level Break: <b>${price:,.2f}</b>\n"
+        f"📊 H1 High    : ${high_1h:,.2f}\n"
+        f"📊 H1 Low     : ${low_1h:,.2f}\n\n"
+        f"⚡ Bias       : {bias_map[signal]}\n"
+        f"⏰ Waktu      : {now}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>⚠️ Bukan financial advice. DYOR.</i>"
+    )
+    return msg
+
+# ─────────────────────────────────────────
+#  MAIN LOOP
+# ─────────────────────────────────────────
+def run():
+    log.info("🚀 ICT MSS/BOS Bot dimulai — XAUUSD H1")
+    send_telegram(
+        "🤖 <b>ICT Bot XAUUSD H1 Aktif!</b>\n"
+        "Memantau MSS & BOS secara otomatis.\n"
+        "Notifikasi akan dikirim saat sinyal terdeteksi."
+    )
 
     while True:
         try:
-            df = get_candles()
-            if df is None or len(df) < 10:
-                log.warning("Data tidak tersedia, coba lagi...")
-                time.sleep(CHECK_INTERVAL)
+            log.info("🔍 Mengambil data XAUUSD H1...")
+            df = get_ohlc(SYMBOL, TIMEFRAME, bars=150)
+
+            if df.empty or len(df) < 20:
+                log.warning("Data tidak cukup, skip...")
+                time.sleep(CHECK_EVERY)
                 continue
 
-            all_signals = []
-            all_signals += detect_bos_choch(df)
-            all_signals += detect_order_block(df)
-            all_signals += detect_fvg(df)
-            all_signals += detect_liquidity_sweep(df)
+            close = df["close"].iloc[-1]
+            log.info(f"Close saat ini: ${close:,.2f}")
 
-            if all_signals:
-                # Buat key unik untuk hindari duplikat
-                signal_key = str([(s["type"], s["direction"]) for s in all_signals])
-                if signal_key not in sent_signals:
-                    message = format_signal_message(all_signals, df)
-                    send_telegram(message)
-                    sent_signals.add(signal_key)
-                    # Bersihkan cache lama agar tidak menumpuk
-                    if len(sent_signals) > 50:
-                        sent_signals.clear()
+            # Deteksi pivot & zigzag
+            pivots = get_pivots(df, SWING_LEN)
+            zz     = build_zigzag(pivots)
+
+            log.info(f"Jumlah zigzag points: {len(zz)}")
+
+            # Deteksi MSS / BOS
+            signal, price_level, new_dir = detect_mss_bos(
+                df, zz, state["mss_dir"]
+            )
+
+            # Update state
+            state["mss_dir"] = new_dir
+
+            if signal:
+                # Hindari kirim sinyal yang sama berulang
+                sig_key = f"{signal}_{price_level:.2f}"
+                if sig_key != state["last_signal"]:
+                    state["last_signal"] = sig_key
+                    msg = format_message(signal, price_level, close, df)
+                    log.info(f"📣 SINYAL: {signal} @ {price_level:.2f}")
+                    send_telegram(msg)
+                else:
+                    log.info(f"Sinyal sama ({signal}), skip duplikat")
             else:
-                log.info("Tidak ada sinyal saat ini.")
+                log.info("Tidak ada sinyal baru")
 
         except Exception as e:
             log.error(f"Error di main loop: {e}")
 
-        time.sleep(CHECK_INTERVAL)
+        log.info(f"⏳ Tunggu {CHECK_EVERY // 60} menit...\n")
+        time.sleep(CHECK_EVERY)
 
-
+# ─────────────────────────────────────────
 if __name__ == "__main__":
-    run_bot()
+    run()
